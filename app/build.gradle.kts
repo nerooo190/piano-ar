@@ -11,7 +11,7 @@ android {
 
     defaultConfig {
         applicationId = "com.pianoar"
-        minSdk = 29
+        minSdk = 31
         targetSdk = 35
         versionCode = runNumber
         versionName = "0.1.$runNumber"

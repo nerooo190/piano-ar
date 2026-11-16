@@ -1,5 +1,6 @@
 package com.pianoar.midi
 
+import android.bluetooth.BluetoothDevice
 import android.content.Context
 import android.media.midi.MidiDevice
 import android.media.midi.MidiDeviceInfo
@@ -10,27 +11,26 @@ import android.os.Handler
 import android.os.Looper
 
 /**
- * Opens every connected MIDI device (USB now, Bluetooth once paired via scan in M1)
- * and forwards note events on the main thread.
+ * Opens every connected MIDI device (USB and Bluetooth LE) and forwards
+ * note and sustain-pedal events on the main thread.
  */
 class MidiHub(
     context: Context,
     private val onNote: (note: Int, velocity: Int, on: Boolean) -> Unit,
+    private val onSustain: (on: Boolean) -> Unit,
     private val onDevicesChanged: (names: List<String>) -> Unit,
 ) {
     private val manager = context.getSystemService(Context.MIDI_SERVICE) as MidiManager?
     private val main = Handler(Looper.getMainLooper())
     private val devices = mutableMapOf<Int, Pair<MidiDevice, List<MidiOutputPort>>>()
+    private val bleConnections = ArrayList<MidiDevice>()
 
     val isSupported get() = manager != null
 
     private val callback = object : MidiManager.DeviceCallback() {
         override fun onDeviceAdded(device: MidiDeviceInfo) = open(device)
         override fun onDeviceRemoved(device: MidiDeviceInfo) {
-            devices.remove(device.id)?.let { (dev, ports) ->
-                ports.forEach { runCatching { it.close() } }
-                runCatching { dev.close() }
-            }
+            devices.remove(device.id)?.let { (dev, ports) -> close(dev, ports) }
             publish()
         }
     }
@@ -45,11 +45,31 @@ class MidiHub(
 
     fun stop() {
         manager?.unregisterDeviceCallback(callback)
-        devices.values.forEach { (dev, ports) ->
-            ports.forEach { runCatching { it.close() } }
-            runCatching { dev.close() }
-        }
+        devices.values.forEach { (dev, ports) -> close(dev, ports) }
         devices.clear()
+        bleConnections.forEach { runCatching { it.close() } }
+        bleConnections.clear()
+    }
+
+    /** Connects a BLE-MIDI instrument. Android then reports it like any other MIDI device. */
+    fun openBluetooth(device: BluetoothDevice) {
+        val mm = manager ?: return
+        mm.openBluetoothDevice(device, { dev ->
+            if (dev == null) return@openBluetoothDevice
+            bleConnections += dev
+            // Fallback if the device callback does not report it.
+            main.postDelayed({
+                if (!devices.containsKey(dev.info.id)) {
+                    devices[dev.info.id] = dev to openPorts(dev, dev.info)
+                    publish()
+                }
+            }, 1500)
+        }, main)
+    }
+
+    private fun close(dev: MidiDevice, ports: List<MidiOutputPort>) {
+        ports.forEach { runCatching { it.close() } }
+        if (dev !in bleConnections) runCatching { dev.close() }
     }
 
     private fun open(info: MidiDeviceInfo) {
@@ -57,14 +77,14 @@ class MidiHub(
         // Output ports are where a keyboard sends its notes to us.
         if (info.outputPortCount == 0 || devices.containsKey(info.id)) return
         mm.openDevice(info, { dev ->
-            if (dev == null) return@openDevice
-            val ports = (0 until info.outputPortCount).mapNotNull { i ->
-                dev.openOutputPort(i)?.also { it.connect(Parser()) }
-            }
-            devices[info.id] = dev to ports
+            if (dev == null || devices.containsKey(info.id)) { dev?.close(); return@openDevice }
+            devices[info.id] = dev to openPorts(dev, info)
             publish()
         }, main)
     }
+
+    private fun openPorts(dev: MidiDevice, info: MidiDeviceInfo) =
+        (0 until info.outputPortCount).mapNotNull { i -> dev.openOutputPort(i)?.also { it.connect(Parser()) } }
 
     private fun publish() {
         onDevicesChanged(devices.values.map { (dev, _) ->
@@ -83,13 +103,14 @@ class MidiHub(
                 val b = msg[i].toInt() and 0xFF
                 when {
                     b >= 0xF8 -> Unit                       // realtime: clock, active sensing
-                    b >= 0xF0 -> { status = 0; count = 0 }  // sysex/common: ignore, cancel running status
+                    b >= 0xF0 -> { status = 0; count = 0 }  // sysex/common: ignore
                     b >= 0x80 -> { status = b; count = 0 }
                     status != 0 -> {
                         data[count++] = b
-                        val needed = if (status and 0xF0 == 0xC0 || status and 0xF0 == 0xD0) 1 else 2
+                        val hi = status and 0xF0
+                        val needed = if (hi == 0xC0 || hi == 0xD0) 1 else 2
                         if (count == needed) {
-                            dispatch(status, data[0], data[1])
+                            dispatch(hi, data[0], data[1])
                             count = 0
                         }
                     }
@@ -97,10 +118,11 @@ class MidiHub(
             }
         }
 
-        private fun dispatch(st: Int, d1: Int, d2: Int) {
-            when (st and 0xF0) {
+        private fun dispatch(hi: Int, d1: Int, d2: Int) {
+            when (hi) {
                 0x90 -> main.post { onNote(d1, d2, d2 > 0) }
                 0x80 -> main.post { onNote(d1, 0, false) }
+                0xB0 -> if (d1 == 64) main.post { onSustain(d2 >= 64) }
             }
         }
     }
