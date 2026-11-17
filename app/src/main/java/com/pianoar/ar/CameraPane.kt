@@ -13,6 +13,7 @@ import android.view.TextureView
 import android.view.View
 import android.widget.FrameLayout
 import com.pianoar.practice.PracticeSession
+import com.pianoar.practice.Visual
 import com.pianoar.song.Hand
 import com.pianoar.song.Music
 import com.pianoar.ui.PianoStageView
@@ -133,6 +134,8 @@ class CameraPane(
                 if (n.end >= t && cal.keyRect(n.pitch, key)) {
                     val user = s.isUserNote(i)
                     if (user && n.start <= t + 0.03) guide[n.pitch] = n.hand + 1
+                    val preview = Visual.userNotePreview
+                    if (user && preview != null && n.start - t > preview) { i++; continue }
                     // Notes travel along the keyboard plane from behind the keys (v > 1) toward the back edge (v = 1).
                     val vNear = 1f + (((n.start - t) / look).toFloat() * lane).coerceAtLeast(0f)
                     val vFar = 1f + (((n.end - t) / look).toFloat() * lane).coerceAtMost(lane)
@@ -144,6 +147,9 @@ class CameraPane(
                         }
                         fill.alpha = if (user) 215 else 90
                         c.drawPath(path, fill)
+                        if (user && Visual.showLabels && Visual.showFingers && toView(((key[0] + key[1]) / 2).toDouble(), vNear + 0.15)) {
+                            c.drawText(s.song.fingers[i].toString(), p[0] - label.textSize * 0.3f, p[1], label)
+                        }
                     }
                 }
                 i++
@@ -162,8 +168,8 @@ class CameraPane(
                 val color = when {
                     pressed[n] && g != 0 -> PianoStageView.HIT_COLOR
                     pressed[n] -> PianoStageView.PRESS_COLOR
-                    g == 1 -> PianoStageView.LEFT_COLOR
-                    g == 2 -> PianoStageView.RIGHT_COLOR
+                    g == 1 && Visual.showKeyGuide -> PianoStageView.LEFT_COLOR
+                    g == 2 && Visual.showKeyGuide -> PianoStageView.RIGHT_COLOR
                     else -> continue
                 }
                 if (!cal.keyRect(n, key) || !quad(key[0], key[1], key[2], key[3])) continue

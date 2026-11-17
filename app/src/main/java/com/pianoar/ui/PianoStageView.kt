@@ -10,6 +10,7 @@ import android.util.SparseIntArray
 import android.view.MotionEvent
 import android.view.View
 import com.pianoar.practice.PracticeSession
+import com.pianoar.practice.Visual
 import com.pianoar.song.Hand
 import com.pianoar.song.Music
 import com.pianoar.song.Song
@@ -32,6 +33,7 @@ class PianoStageView(context: Context, private val floating: Boolean = false) : 
     private var blackBottom = 0f
     private val pointerNotes = SparseIntArray()
     private val guide = IntArray(128) // 0 none, 1 left, 2 right
+    private val guideFinger = IntArray(128)
 
     private val fill = Paint(Paint.ANTI_ALIAS_FLAG)
     private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = 2f }
@@ -76,6 +78,7 @@ class PianoStageView(context: Context, private val floating: Boolean = false) : 
     override fun onDraw(c: Canvas) {
         c.drawColor(if (floating) Color.BLACK else BG)
         guide.fill(0)
+        guideFinger.fill(0)
 
         // Octave lanes
         fill.color = if (floating) Color.rgb(30, 30, 40) else Color.rgb(32, 32, 44)
@@ -110,7 +113,9 @@ class PianoStageView(context: Context, private val floating: Boolean = false) : 
             val r = rects.getOrNull(n.pitch)
             if (n.end >= t && r != null) {
                 val user = s.isUserNote(i)
-                if (user && n.start <= t + 0.03 && n.end > t) guide[n.pitch] = n.hand + 1
+                if (user && n.start <= t + 0.03 && n.end > t) { guide[n.pitch] = n.hand + 1; guideFinger[n.pitch] = s.song.fingers[i] }
+                val preview = Visual.userNotePreview
+                if (user && preview != null && n.start - t > preview) { i++; continue }
                 val yb = (kbTop - (n.start - t) * pps).toFloat().coerceAtMost(kbTop)
                 val yt = (kbTop - (n.end - t) * pps).toFloat()
                 val base = if (n.hand == Hand.LEFT) LEFT_COLOR else RIGHT_COLOR
@@ -123,8 +128,9 @@ class PianoStageView(context: Context, private val floating: Boolean = false) : 
                 val inset = r.width() * 0.08f
                 noteRect.set(r.left + inset, yt, r.right - inset, yb)
                 c.drawRoundRect(noteRect, 8f, 8f, fill)
-                if (yb - yt > text.textSize * 1.4f && r.width() > 16f) {
-                    c.drawText(Music.noteName(n.pitch).dropLast(1), noteRect.centerX(), yb - text.textSize * 0.4f, text)
+                if (Visual.showLabels && yb - yt > text.textSize * 1.4f && r.width() > 16f) {
+                    val lbl = if (Visual.showFingers && user) s.song.fingers[i].toString() else Music.noteName(n.pitch).dropLast(1)
+                    c.drawText(lbl, noteRect.centerX(), yb - text.textSize * 0.4f, text)
                 }
             }
             i++
@@ -140,14 +146,21 @@ class PianoStageView(context: Context, private val floating: Boolean = false) : 
             fill.color = when {
                 pressed[n] && g != 0 -> HIT_COLOR
                 pressed[n] -> PRESS_COLOR
-                g == 1 -> LEFT_COLOR
-                g == 2 -> RIGHT_COLOR
+                g == 1 && Visual.showKeyGuide -> LEFT_COLOR
+                g == 2 && Visual.showKeyGuide -> RIGHT_COLOR
                 floating -> if (black) Color.BLACK else Color.rgb(22, 22, 28)
                 else -> if (black) Color.rgb(18, 18, 22) else Color.rgb(245, 245, 240)
             }
             c.drawRect(r, fill)
             stroke.color = if (floating) Color.rgb(90, 90, 110) else Color.rgb(60, 60, 60)
             c.drawRect(r, stroke)
+        }
+        // Finger hints on the keys to play now ("ghost hand" numbers)
+        if (Visual.showLabels && Visual.showFingers) {
+            text.color = Color.WHITE
+            for (n in lowNote..highNote) if (guideFinger[n] > 0 && !pressed[n]) rects[n]?.let {
+                c.drawText(guideFinger[n].toString(), it.centerX(), (if (Music.isBlack(n)) it.bottom else blackBottom) - text.textSize * 0.6f, text)
+            }
         }
         // C labels on the white keys
         text.color = if (floating) Color.rgb(140, 140, 160) else Color.rgb(90, 90, 90)

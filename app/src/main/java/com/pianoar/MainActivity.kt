@@ -10,6 +10,8 @@ import android.graphics.Color
 import android.hardware.display.DisplayManager
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.OpenableColumns
 import android.view.Choreographer
 import android.view.Display
@@ -33,12 +35,17 @@ import com.pianoar.audio.PianoAudio
 import com.pianoar.display.GlassesPresentation
 import com.pianoar.midi.BleMidiScanner
 import com.pianoar.midi.MidiHub
+import com.pianoar.practice.History
+import com.pianoar.practice.LearningPlan
 import com.pianoar.practice.PracticeSession
+import com.pianoar.practice.Visual
 import com.pianoar.song.BuiltinSongs
 import com.pianoar.song.MidiFileParser
 import com.pianoar.song.Music
 import com.pianoar.song.Song
+import com.pianoar.ui.DayBarsView
 import com.pianoar.ui.PianoStageView
+import com.pianoar.ui.StaffView
 import java.io.File
 import kotlin.math.roundToInt
 
@@ -57,7 +64,10 @@ class MainActivity : Activity() {
     private var currentSong: Song? = null
     private var onHome = true
     private var arActive = false
-    private var phoneAnimated: View? = null
+    private val animated = ArrayList<View>()
+    private var plan: LearningPlan? = null
+    private val history by lazy { History(filesDir) }
+    private val main = Handler(Looper.getMainLooper())
     private var phonePane: CameraPane? = null
 
     private var statusView: TextView? = null
@@ -77,7 +87,7 @@ class MainActivity : Activity() {
     private val frame = object : Choreographer.FrameCallback {
         override fun doFrame(frameTimeNanos: Long) {
             session?.tick(System.nanoTime())
-            phoneAnimated?.invalidate()
+            for (v in animated) v.invalidate()
             glasses?.animated?.invalidate()
             Choreographer.getInstance().postFrameCallback(this)
         }
@@ -97,6 +107,8 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         appSound = prefs.getBoolean("appSound", true)
+        Visual.memoryLevel = prefs.getInt("memoryLevel", 0)
+        Visual.showFingers = prefs.getBoolean("showFingers", true)
 
         audio = PianoAudio(this).apply {
             onReady = { sampled ->
@@ -194,7 +206,8 @@ class MainActivity : Activity() {
             camera?.close()
         }
         phonePane = null
-        phoneAnimated = null
+        animated.clear()
+        plan = null
         rangeCapture = 0
     }
 
@@ -220,6 +233,7 @@ class MainActivity : Activity() {
         buttons.addView(button("📶 Bluetooth-MIDI") { startBluetooth() })
         buttons.addView(button("🎹 Frei spielen") { showPlayer(null) })
         buttons.addView(button("📷 Kamera-AR frei") { showPlayer(null, ar = true) })
+        buttons.addView(button("📊 Statistik") { showStats() })
         root.addView(HorizontalScrollView(this).apply { addView(buttons) })
 
         root.addView(CheckBox(this).apply {
@@ -271,7 +285,9 @@ class MainActivity : Activity() {
             requestPermissions(arrayOf(Manifest.permission.CAMERA), REQ_CAM)
             return
         }
+        val keepPlan = plan.takeIf { keep != null }
         leavePlayer()
+        plan = keepPlan
         onHome = false
         arActive = ar
         prefs.edit().putBoolean("lastAr", ar).apply()
@@ -282,31 +298,83 @@ class MainActivity : Activity() {
 
         val root = column()
         val bar = row()
+        val learn = row()
         val tools = row().apply { visibility = View.GONE }
         bar.addView(button("←") { showHome() })
-        lateinit var play: Button
         if (s != null) {
-            play = button(if (s.playing) "⏸ Pause" else "▶ Start") { s.togglePlay(); play.text = if (s.playing) "⏸ Pause" else "▶ Start" }
-            bar.addView(play)
-            bar.addView(button("⟲") { s.restart(); audio.allOff(); play.text = "▶ Start" })
-            bar.addView(button(s.mode.label) { v ->
-                s.mode = PracticeSession.Mode.entries[(s.mode.ordinal + 1) % PracticeSession.Mode.entries.size]
-                (v as Button).text = s.mode.label; play.text = "▶ Start"; audio.allOff()
-            })
-            bar.addView(button(s.hands.label) { v ->
-                s.hands = PracticeSession.Hands.entries[(s.hands.ordinal + 1) % PracticeSession.Hands.entries.size]
-                (v as Button).text = s.hands.label; play.text = "▶ Start"; audio.allOff()
-            })
+            lateinit var play: Button
+            lateinit var modeBtn: Button
+            lateinit var handsBtn: Button
             val tempoLabel = TextView(this).apply { setTextColor(Color.WHITE); textSize = 16f; setPadding(12, 0, 12, 0) }
-            fun showTempo() { tempoLabel.text = "Tempo ${(s.tempo * 100).roundToInt()} %" }
-            bar.addView(button("−") { s.tempo -= 0.1; showTempo() })
-            bar.addView(tempoLabel)
-            bar.addView(button("+") { s.tempo += 0.1; showTempo() })
-            showTempo()
-            s.onFinished = { st ->
-                play.text = "▶ Start"
-                showResults(s, st, play)
+            val planLabel = TextView(this).apply { setTextColor(PianoStageView.HIT_COLOR); textSize = 15f; setPadding(16, 0, 16, 0) }
+            fun refresh() {
+                play.text = if (s.playing) "⏸ Pause" else "▶ Start"
+                modeBtn.text = s.mode.label
+                handsBtn.text = s.hands.label
+                tempoLabel.text = "Tempo ${(s.tempo * 100).roundToInt()} %"
+                planLabel.text = plan?.label ?: "Abschnitte: ${s.song.sections.size}"
+                glasses?.setInfo(plan?.label?.let { "${s.song.title} · $it" } ?: "Piano AR · ${s.song.title}")
             }
+            play = button("▶ Start") { s.togglePlay(); refresh() }
+            bar.addView(play)
+            bar.addView(button("⟲") { s.restart(); audio.allOff(); refresh() })
+            modeBtn = button(s.mode.label) {
+                s.mode = PracticeSession.Mode.entries[(s.mode.ordinal + 1) % PracticeSession.Mode.entries.size]
+                audio.allOff(); refresh()
+            }
+            bar.addView(modeBtn)
+            handsBtn = button(s.hands.label) {
+                s.hands = PracticeSession.Hands.entries[(s.hands.ordinal + 1) % PracticeSession.Hands.entries.size]
+                audio.allOff(); refresh()
+            }
+            bar.addView(handsBtn)
+            bar.addView(button("−") { s.tempo -= 0.1; refresh() })
+            bar.addView(tempoLabel)
+            bar.addView(button("+") { s.tempo += 0.1; refresh() })
+
+            // Learning row
+            learn.addView(button(if (plan != null) "📚 Lernplan aus" else "📚 Lernplan") { v ->
+                if (plan == null) {
+                    plan = LearningPlan(s).also { it.apply() }
+                    (v as Button).text = "📚 Lernplan aus"
+                    toast("Lernplan: jeder Abschnitt erst langsam mit einzelnen Händen, dann zusammen")
+                } else {
+                    plan = null
+                    s.clearRange(); s.tempo = 1.0; s.hands = PracticeSession.Hands.BOTH
+                    (v as Button).text = "📚 Lernplan"
+                }
+                audio.allOff(); refresh()
+            })
+            learn.addView(button("⏮") { plan?.let { it.jumpTo(it.section - 1); refresh() } ?: toast("Erst Lernplan starten") })
+            learn.addView(button("⏭") { plan?.let { it.jumpTo(it.section + 1); refresh() } ?: toast("Erst Lernplan starten") })
+            learn.addView(button("🧠 ${Visual.memoryLabels[Visual.memoryLevel]}") { v ->
+                Visual.memoryLevel = (Visual.memoryLevel + 1) % Visual.memoryLabels.size
+                prefs.edit().putInt("memoryLevel", Visual.memoryLevel).apply()
+                (v as Button).text = "🧠 ${Visual.memoryLabels[Visual.memoryLevel]}"
+            })
+            learn.addView(button(if (Visual.showFingers) "🔢 Finger an" else "🔢 Finger aus") { v ->
+                Visual.showFingers = !Visual.showFingers
+                prefs.edit().putBoolean("showFingers", Visual.showFingers).apply()
+                (v as Button).text = if (Visual.showFingers) "🔢 Finger an" else "🔢 Finger aus"
+            })
+            if (!ar) learn.addView(button("🎼 Notenzeile") {
+                prefs.edit().putBoolean("showStaff", !prefs.getBoolean("showStaff", false)).apply()
+                showPlayer(song, false, s)
+            })
+            learn.addView(planLabel)
+
+            s.onFinished = { st ->
+                recordHistory(s, st)
+                val p = plan
+                if (p != null) {
+                    val msg = p.onResult(st)
+                    toast(msg)
+                    if (p.done) { plan = null; showResults(s, st) { refresh() } }
+                    else main.postDelayed({ if (session === s && plan === p) { s.play(); refresh() } }, 1500)
+                } else showResults(s, st) { refresh() }
+                refresh()
+            }
+            refresh()
         }
         bar.addView(button(if (ar) "🎵 Wasserfall" else "📷 Kamera-AR") { showPlayer(song, !ar, s) })
 
@@ -354,27 +422,34 @@ class MainActivity : Activity() {
             textSize = 15f
         })
         root.addView(HorizontalScrollView(this).apply { addView(bar) })
+        if (s != null) root.addView(HorizontalScrollView(this).apply { addView(learn) })
         root.addView(HorizontalScrollView(this).apply { addView(tools) })
 
-        val content: View = if (ar) {
+        if (ar) {
             val feed = ensureCamera()
-            CameraPane(this, feed, calibration, ::phoneRotation, interactive = true).also { p ->
+            val p = CameraPane(this, feed, calibration, ::phoneRotation, interactive = true).also { p ->
                 p.session = s
                 p.pressed = pressed
                 p.onCalibrationChanged = { glasses?.cameraPane?.overlay?.invalidate() }
                 phonePane = p
-                phoneAnimated = p.overlay
+                animated += p.overlay
             }
+            root.addView(p, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
         } else {
-            PianoStageView(this).also { v ->
+            if (s != null && prefs.getBoolean("showStaff", false)) {
+                val staff = StaffView(this).also { it.session = s }
+                animated += staff
+                root.addView(staff, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 0.45f))
+            }
+            val v = PianoStageView(this).also { v ->
                 v.session = s
                 v.pressed = pressed
                 v.onTouchNote = { n, on -> onInput(n, 90, on, fromTouch = true) }
                 v.post { v.fitTo(song) }
-                phoneAnimated = v
+                animated += v
             }
+            root.addView(v, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
         }
-        root.addView(content, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
         setContentView(root)
 
         configureGlasses()
@@ -396,7 +471,15 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun showResults(s: PracticeSession, st: PracticeSession.Stats, play: Button) {
+    private fun recordHistory(s: PracticeSession, st: PracticeSession.Stats) {
+        if (s.mode == PracticeSession.Mode.LISTEN || st.total == 0) return
+        history.add(History.Entry(
+            System.currentTimeMillis(), s.song.title, s.mode.name, s.hands.name, s.tempo,
+            st.accuracy, st.hits, st.total, st.wrong, st.meanErrorMs, s.practiceSeconds, s.isFullSong, Visual.memoryLevel,
+        ))
+    }
+
+    private fun showResults(s: PracticeSession, st: PracticeSession.Stats, refresh: () -> Unit) {
         val msg = buildString {
             appendLine("Treffer: ${st.hits} / ${st.total}  (${st.accuracy.roundToInt()} %)")
             if (s.mode == PracticeSession.Mode.PLAY) appendLine("Verpasst: ${st.missed}")
@@ -404,15 +487,64 @@ class MainActivity : Activity() {
             st.meanErrorMs?.let { appendLine("Ø Timing-Abweichung: ${it.roundToInt()} ms") }
             if (st.rightTotal > 0) appendLine("Rechte Hand: ${st.rightHits} / ${st.rightTotal}")
             if (st.leftTotal > 0) appendLine("Linke Hand: ${st.leftHits} / ${st.leftTotal}")
+            appendLine("Gedächtnis-Stufe: ${Visual.memoryLabels[Visual.memoryLevel]}")
         }
         glasses?.setInfo("Ergebnis: ${st.accuracy.roundToInt()} % · ${st.wrong} falsch")
-        AlertDialog.Builder(this)
+        val b = AlertDialog.Builder(this)
             .setTitle(if (st.accuracy >= 90) "Super! 🎉" else "Ergebnis")
             .setMessage(msg)
-            .setPositiveButton("Nochmal") { _, _ -> s.restart(); s.togglePlay(); play.text = "⏸ Pause" }
+            .setPositiveButton("Nochmal") { _, _ -> s.restart(); s.togglePlay(); refresh() }
             .setNegativeButton("Zurück") { _, _ -> showHome() }
-            .setNeutralButton("Schließen", null)
-            .show()
+        if (st.accuracy >= 90 && Visual.memoryLevel < Visual.memoryLabels.size - 1) {
+            b.setNeutralButton("🧠 Weniger Hilfe") { _, _ ->
+                Visual.memoryLevel++
+                prefs.edit().putInt("memoryLevel", Visual.memoryLevel).apply()
+                showPlayer(s.song, arActive, s.also { it.restart() })
+            }
+        } else b.setNeutralButton("Schließen", null)
+        b.show()
+    }
+
+    private fun showStats() {
+        leavePlayer()
+        session = null
+        currentSong = null
+        configureGlasses()
+        onHome = false
+        val entries = history.all()
+        val root = column().apply { setPadding(40, 24, 40, 16) }
+        val head = row()
+        head.addView(button("←") { showHome() })
+        head.addView(TextView(this).apply { text = "  📊 Statistik"; textSize = 24f; setTextColor(ACCENT) })
+        root.addView(head)
+
+        val totalMin = entries.sumOf { it.seconds } / 60.0
+        val today = entries.filter { it.date == java.time.LocalDate.now() }.sumOf { it.seconds } / 60.0
+        root.addView(TextView(this).apply {
+            textSize = 16f
+            setTextColor(Color.WHITE)
+            setPadding(0, 12, 0, 12)
+            text = "🔥 Serie: ${history.streak(entries)} Tage   ·   Heute: ${today.roundToInt()} min   ·   " +
+                "Gesamt: ${(totalMin / 60).toInt()} h ${(totalMin % 60).roundToInt()} min   ·   Durchläufe: ${entries.size}"
+        })
+        root.addView(DayBarsView(this, history.minutesPerDay(entries, 14)),
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 0.8f))
+
+        val lines = entries.groupBy { it.song }.map { (song, list) ->
+            val full = list.filter { it.fullSong }
+            val best = (full.ifEmpty { list }).maxOf { it.accuracy }
+            val last = list.last()
+            val trend = list.takeLast(5).joinToString(" ") { "${it.accuracy.roundToInt()}" }
+            val timing = list.mapNotNull { it.meanErrorMs }.takeLast(5).takeIf { it.isNotEmpty() }?.average()
+            last.time to "$song\n   Bestwert ${best.roundToInt()} % · zuletzt ${last.accuracy.roundToInt()} % · " +
+                "${list.size}× geübt · ${(list.sumOf { it.seconds } / 60).roundToInt()} min" +
+                (timing?.let { " · Timing Ø ${it.roundToInt()} ms" } ?: "") + "\n   Verlauf: $trend"
+        }.sortedByDescending { it.first }.map { it.second }
+        root.addView(ListView(this).apply {
+            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_list_item_1,
+                lines.ifEmpty { listOf("Noch keine Durchläufe – spiel einen Song bis zum Ende!") })
+        }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1.2f))
+        setContentView(root)
     }
 
     // ───────────────────────── Camera AR ─────────────────────────
