@@ -14,16 +14,21 @@ import android.provider.OpenableColumns
 import android.view.Choreographer
 import android.view.Display
 import android.view.Gravity
+import android.view.Surface
 import android.view.View
 import android.view.WindowManager
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.CheckBox
+import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.TextView
 import android.widget.Toast
+import com.pianoar.ar.CameraFeed
+import com.pianoar.ar.CameraPane
+import com.pianoar.ar.KeyboardCalibration
 import com.pianoar.audio.PianoAudio
 import com.pianoar.display.GlassesPresentation
 import com.pianoar.midi.BleMidiScanner
@@ -43,25 +48,37 @@ class MainActivity : Activity() {
     private lateinit var midi: MidiHub
     private lateinit var displayManager: DisplayManager
     private val prefs by lazy { getSharedPreferences("pianoar", MODE_PRIVATE) }
+    private val calibration by lazy { KeyboardCalibration(prefs) }
+    private var camera: CameraFeed? = null
 
     private var glasses: GlassesPresentation? = null
     private val pressed = BooleanArray(128)
     private var session: PracticeSession? = null
-    private var stage: PianoStageViewRef = PianoStageViewRef()
+    private var currentSong: Song? = null
+    private var onHome = true
+    private var arActive = false
+    private var phoneAnimated: View? = null
+    private var phonePane: CameraPane? = null
+
     private var statusView: TextView? = null
     private var midiText = "MIDI: –"
     private var glassesText = "Brille: –"
     private var soundText = "Klang: lädt Klavier…"
     private var appSound = true
-    private var onHome = true
+
+    private var rangeCapture = 0          // 0 off, 1 waiting for lowest key, 2 waiting for highest
+    private var rangeLow = 0
+    private var rangeLabel: Button? = null
+    private var pendingArSong: Song? = null
+    private var pendingArSession: PracticeSession? = null
 
     private val importDir by lazy { File(filesDir, "imports").apply { mkdirs() } }
 
     private val frame = object : Choreographer.FrameCallback {
         override fun doFrame(frameTimeNanos: Long) {
             session?.tick(System.nanoTime())
-            stage.phone?.invalidate()
-            glasses?.stage?.invalidate()
+            phoneAnimated?.invalidate()
+            glasses?.animated?.invalidate()
             Choreographer.getInstance().postFrameCallback(this)
         }
     }
@@ -69,7 +86,9 @@ class MainActivity : Activity() {
     private val displayListener = object : DisplayManager.DisplayListener {
         override fun onDisplayAdded(displayId: Int) = updateGlasses()
         override fun onDisplayRemoved(displayId: Int) = updateGlasses()
-        override fun onDisplayChanged(displayId: Int) = updateGlasses()
+        override fun onDisplayChanged(displayId: Int) {
+            if (displayId == Display.DEFAULT_DISPLAY) updateTransforms() else updateGlasses()
+        }
     }
 
     // ───────────────────────── Lifecycle ─────────────────────────
@@ -116,17 +135,20 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         Choreographer.getInstance().postFrameCallback(frame)
+        if (arActive) openCamera()
     }
 
     override fun onPause() {
         Choreographer.getInstance().removeFrameCallback(frame)
         session?.let { if (it.playing) it.togglePlay() }
+        camera?.close()
         super.onPause()
     }
 
     override fun onDestroy() {
         displayManager.unregisterDisplayListener(displayListener)
         glasses?.dismiss()
+        camera?.close()
         midi.stop()
         audio.stop()
         super.onDestroy()
@@ -141,6 +163,19 @@ class MainActivity : Activity() {
 
     private fun onInput(note: Int, velocity: Int, on: Boolean, fromTouch: Boolean) {
         if (note !in 0..127) return
+        if (on && rangeCapture > 0 && !fromTouch) {
+            if (rangeCapture == 1) {
+                rangeLow = note; rangeCapture = 2
+                toast("Tiefste Taste: ${Music.noteName(note)}. Jetzt die HÖCHSTE Taste drücken.")
+            } else {
+                calibration.setRange(rangeLow, note)
+                calibration.save()
+                rangeCapture = 0
+                rangeLabel?.text = rangeText()
+                toast("Tastenbereich: ${rangeText()}")
+            }
+            return
+        }
         pressed[note] = on
         if (fromTouch || appSound) {
             if (on) audio.noteOn(note, velocity) else audio.noteOff(note)
@@ -151,14 +186,24 @@ class MainActivity : Activity() {
 
     // ───────────────────────── Screens ─────────────────────────
 
-    private fun showHome() {
-        onHome = true
+    private fun leavePlayer() {
         session?.let { if (it.playing) it.togglePlay() }
-        session = null
-        stage.phone = null
         audio.allOff()
-        glasses?.stage?.apply { session = null; fitTo(null) }
-        glasses?.setInfo("Piano AR")
+        if (arActive) {
+            arActive = false
+            camera?.close()
+        }
+        phonePane = null
+        phoneAnimated = null
+        rangeCapture = 0
+    }
+
+    private fun showHome() {
+        leavePlayer()
+        onHome = true
+        session = null
+        currentSong = null
+        configureGlasses()
 
         val root = column().apply { setPadding(40, 24, 40, 16) }
         root.addView(TextView(this).apply {
@@ -174,6 +219,7 @@ class MainActivity : Activity() {
         buttons.addView(button("📂 MIDI-Datei öffnen") { pickMidiFile() })
         buttons.addView(button("📶 Bluetooth-MIDI") { startBluetooth() })
         buttons.addView(button("🎹 Frei spielen") { showPlayer(null) })
+        buttons.addView(button("📷 Kamera-AR frei") { showPlayer(null, ar = true) })
         root.addView(HorizontalScrollView(this).apply { addView(buttons) })
 
         root.addView(CheckBox(this).apply {
@@ -202,7 +248,7 @@ class MainActivity : Activity() {
                 val song = e.song ?: runCatching {
                     MidiFileParser.parse(e.file!!.readBytes(), e.file.nameWithoutExtension)
                 }.getOrElse { toast("Datei fehlerhaft: ${it.message}"); null }
-                song?.let { showPlayer(it) }
+                song?.let { showPlayer(it, ar = prefs.getBoolean("lastAr", false)) }
             }
             setOnItemLongClickListener { _, _, pos, _ ->
                 val f = entries[pos].file ?: return@setOnItemLongClickListener false
@@ -218,23 +264,29 @@ class MainActivity : Activity() {
         setContentView(root)
     }
 
-    private fun showPlayer(song: Song?) {
+    private fun showPlayer(song: Song?, ar: Boolean = false, keep: PracticeSession? = null) {
+        if (ar && checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            pendingArSong = song
+            pendingArSession = keep
+            requestPermissions(arrayOf(Manifest.permission.CAMERA), REQ_CAM)
+            return
+        }
+        leavePlayer()
         onHome = false
-        val s = song?.let { PracticeSession(it, audio) }
+        arActive = ar
+        prefs.edit().putBoolean("lastAr", ar).apply()
+        val s = keep ?: song?.let { PracticeSession(it, audio) }
         session = s
+        currentSong = song
         statusView = null
 
         val root = column()
-        val bar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(16, 8, 16, 8)
-        }
+        val bar = row()
+        val tools = row().apply { visibility = View.GONE }
         bar.addView(button("←") { showHome() })
+        lateinit var play: Button
         if (s != null) {
-            lateinit var play: Button
-            lateinit var tempoLabel: TextView
-            play = button("▶ Start") { s.togglePlay(); play.text = if (s.playing) "⏸ Pause" else "▶ Start" }
+            play = button(if (s.playing) "⏸ Pause" else "▶ Start") { s.togglePlay(); play.text = if (s.playing) "⏸ Pause" else "▶ Start" }
             bar.addView(play)
             bar.addView(button("⟲") { s.restart(); audio.allOff(); play.text = "▶ Start" })
             bar.addView(button(s.mode.label) { v ->
@@ -245,41 +297,103 @@ class MainActivity : Activity() {
                 s.hands = PracticeSession.Hands.entries[(s.hands.ordinal + 1) % PracticeSession.Hands.entries.size]
                 (v as Button).text = s.hands.label; play.text = "▶ Start"; audio.allOff()
             })
-            tempoLabel = TextView(this).apply { setTextColor(Color.WHITE); textSize = 16f; setPadding(12, 0, 12, 0) }
+            val tempoLabel = TextView(this).apply { setTextColor(Color.WHITE); textSize = 16f; setPadding(12, 0, 12, 0) }
             fun showTempo() { tempoLabel.text = "Tempo ${(s.tempo * 100).roundToInt()} %" }
             bar.addView(button("−") { s.tempo -= 0.1; showTempo() })
             bar.addView(tempoLabel)
             bar.addView(button("+") { s.tempo += 0.1; showTempo() })
             showTempo()
-            bar.addView(TextView(this).apply {
-                text = "  ${song.title}"
-                setTextColor(Color.rgb(170, 170, 190))
-                textSize = 15f
-            })
             s.onFinished = { st ->
                 play.text = "▶ Start"
                 showResults(s, st, play)
             }
-            glasses?.setInfo("Piano AR · ${song.title}")
-        } else {
-            bar.addView(TextView(this).apply {
-                text = "  Frei spielen – Keyboard anschließen oder auf die Tasten tippen"
-                setTextColor(Color.rgb(170, 170, 190))
-            })
         }
-        root.addView(HorizontalScrollView(this).apply { addView(bar) })
+        bar.addView(button(if (ar) "🎵 Wasserfall" else "📷 Kamera-AR") { showPlayer(song, !ar, s) })
 
-        val v = PianoStageView(this).apply {
-            session = s
-            pressed = this@MainActivity.pressed
-            onTouchNote = { n, on -> onInput(n, 90, on, fromTouch = true) }
-            post { fitTo(song) }
+        if (ar) {
+            bar.addView(button("📐 Kalibrieren") {
+                val on = !(phonePane?.calibrating ?: false)
+                phonePane?.calibrating = on
+                glasses?.cameraPane?.calibrating = on
+                tools.visibility = if (on) View.VISIBLE else View.GONE
+                if (on) toast("Ziehe die gelben Punkte auf die 4 Ecken der Tastatur")
+            })
+            rangeLabel = button(rangeText()) {
+                val presets = KeyboardCalibration.PRESETS
+                val idx = presets.indexOfFirst { it.second == calibration.lowNote && it.third == calibration.highNote }
+                val next = presets[(idx + 1) % presets.size]
+                calibration.setRange(next.second, next.third)
+                calibration.save()
+                rangeLabel?.text = rangeText()
+            }
+            tools.addView(rangeLabel)
+            tools.addView(button("🎹 Bereich per MIDI") {
+                rangeCapture = 1
+                toast("Drücke die TIEFSTE Taste deines Keyboards")
+            })
+            tools.addView(button("🔄 Kamera vorne/hinten") {
+                calibration.useFrontCamera = !calibration.useFrontCamera
+                calibration.save()
+                camera?.useFront = calibration.useFrontCamera
+                camera?.reopen()
+                updateTransforms()
+            })
+            tools.addView(button("⇋ Spiegeln") {
+                calibration.mirror = !calibration.mirror
+                calibration.save()
+                updateTransforms()
+            })
+            tools.addView(button("Notenbahn −") { calibration.laneLength = (calibration.laneLength - 1f).coerceAtLeast(1f); calibration.save() })
+            tools.addView(button("Notenbahn +") { calibration.laneLength = (calibration.laneLength + 1f).coerceAtMost(10f); calibration.save() })
+            tools.addView(button("Ecken zurücksetzen") { calibration.reset(); calibration.save(); phonePane?.overlay?.invalidate() })
         }
-        stage.phone = v
-        root.addView(v, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+
+        bar.addView(TextView(this).apply {
+            text = "  " + (song?.title ?: if (ar) "Kamera-AR – frei spielen" else "Frei spielen – Keyboard anschließen oder Tasten tippen")
+            setTextColor(Color.rgb(170, 170, 190))
+            textSize = 15f
+        })
+        root.addView(HorizontalScrollView(this).apply { addView(bar) })
+        root.addView(HorizontalScrollView(this).apply { addView(tools) })
+
+        val content: View = if (ar) {
+            val feed = ensureCamera()
+            CameraPane(this, feed, calibration, ::phoneRotation, interactive = true).also { p ->
+                p.session = s
+                p.pressed = pressed
+                p.onCalibrationChanged = { glasses?.cameraPane?.overlay?.invalidate() }
+                phonePane = p
+                phoneAnimated = p.overlay
+            }
+        } else {
+            PianoStageView(this).also { v ->
+                v.session = s
+                v.pressed = pressed
+                v.onTouchNote = { n, on -> onInput(n, 90, on, fromTouch = true) }
+                v.post { v.fitTo(song) }
+                phoneAnimated = v
+            }
+        }
+        root.addView(content, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
         setContentView(root)
 
-        glasses?.stage?.apply { session = s; pressed = this@MainActivity.pressed; fitTo(song) }
+        configureGlasses()
+        if (ar) {
+            openCamera()
+            if (!prefs.getBoolean("arHintShown", false)) {
+                prefs.edit().putBoolean("arHintShown", true).apply()
+                AlertDialog.Builder(this)
+                    .setTitle("Kamera-AR einrichten")
+                    .setMessage(
+                        "1. Stell das Handy so auf, dass die Kamera die ganze Tastatur sieht (z. B. auf einem Stativ schräg hinter dir oder auf dem Notenständer mit Frontkamera).\n\n" +
+                        "2. Tippe auf „📐 Kalibrieren“ und ziehe die 4 gelben Punkte auf die Ecken der Tastatur.\n\n" +
+                        "3. Wähle die Tastenanzahl oder nutze „Bereich per MIDI“.\n\n" +
+                        "Mit XREAL-Brille siehst du das Kamerabild mit den Noten groß vor dir."
+                    )
+                    .setPositiveButton("Los geht's", null)
+                    .show()
+            }
+        }
     }
 
     private fun showResults(s: PracticeSession, st: PracticeSession.Stats, play: Button) {
@@ -300,6 +414,34 @@ class MainActivity : Activity() {
             .setNeutralButton("Schließen", null)
             .show()
     }
+
+    // ───────────────────────── Camera AR ─────────────────────────
+
+    private fun ensureCamera(): CameraFeed = camera ?: CameraFeed(this).also { c ->
+        c.onError = { msg -> toast(msg) }
+        c.onPreviewSizeChanged = { runOnUiThread { updateTransforms() } }
+        camera = c
+    }
+
+    private fun openCamera() {
+        val c = ensureCamera()
+        c.useFront = calibration.useFrontCamera
+        c.open()
+    }
+
+    private fun updateTransforms() {
+        phonePane?.updateTransform()
+        glasses?.cameraPane?.updateTransform()
+    }
+
+    private fun phoneRotation(): Int = when (displayManager.getDisplay(Display.DEFAULT_DISPLAY)?.rotation) {
+        Surface.ROTATION_90 -> 90
+        Surface.ROTATION_180 -> 180
+        Surface.ROTATION_270 -> 270
+        else -> 0
+    }
+
+    private fun rangeText() = "🎹 ${Music.noteName(calibration.lowNote)}–${Music.noteName(calibration.highNote)}"
 
     // ───────────────────────── MIDI files ─────────────────────────
 
@@ -334,7 +476,7 @@ class MainActivity : Activity() {
             val safe = title.replace(Regex("[^\\p{L}\\p{N} ._-]"), "_").take(80)
             File(importDir, "$safe.mid").writeBytes(bytes)
             toast("Importiert: $title (${song.notes.size} Noten)")
-            showPlayer(song)
+            showPlayer(song, ar = prefs.getBoolean("lastAr", false))
         } catch (e: Exception) {
             toast("Import fehlgeschlagen: ${e.message}")
         }
@@ -350,14 +492,13 @@ class MainActivity : Activity() {
         }
         val found = ArrayList<BluetoothDevice>()
         val adapter = ArrayAdapter<String>(this, android.R.layout.simple_list_item_1)
-        lateinit var dialog: AlertDialog
         val scanner = BleMidiScanner(this) { d ->
             found += d
             adapter.add(d.name ?: d.address)
         }
         if (!scanner.isAvailable) { toast("Kein Bluetooth verfügbar"); return }
         if (!scanner.isEnabled) { toast("Bitte Bluetooth einschalten"); return }
-        dialog = AlertDialog.Builder(this)
+        AlertDialog.Builder(this)
             .setTitle("Bluetooth-MIDI suchen… (Keyboard in Pairing-Modus)")
             .setAdapter(adapter) { _, which ->
                 scanner.stop()
@@ -366,16 +507,17 @@ class MainActivity : Activity() {
             }
             .setNegativeButton("Abbrechen", null)
             .setOnDismissListener { scanner.stop() }
-            .create()
-        dialog.show()
+            .show()
         scanner.start()
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == REQ_BT) {
-            if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) startBluetooth()
-            else toast("Ohne Bluetooth-Berechtigung keine Bluetooth-MIDI-Suche")
+        val granted = grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }
+        when (requestCode) {
+            REQ_BT -> if (granted) startBluetooth() else toast("Ohne Bluetooth-Berechtigung keine Bluetooth-MIDI-Suche")
+            REQ_CAM -> if (granted) showPlayer(pendingArSong, ar = true, keep = pendingArSession)
+                       else toast("Ohne Kamera-Berechtigung kein Kamera-AR")
         }
     }
 
@@ -394,21 +536,35 @@ class MainActivity : Activity() {
         if (glasses?.display?.displayId != display.displayId) {
             glasses?.dismiss()
             glasses = try {
-                GlassesPresentation(this, display).also { g ->
-                    g.show()
-                    g.stage.session = session
-                    g.stage.pressed = pressed
-                    g.stage.post { g.stage.fitTo(session?.song) }
-                }
+                GlassesPresentation(this, display).also { it.show() }
             } catch (e: WindowManager.InvalidDisplayException) {
                 null
             }
+            configureGlasses()
         }
         val mode = display.mode
         glassesText = if (glasses != null)
             "Brille: ${display.name} · ${mode.physicalWidth}×${mode.physicalHeight} @ ${mode.refreshRate.roundToInt()} Hz"
         else "Brille: ${display.name} gefunden, Anzeige fehlgeschlagen"
         updateStatus()
+    }
+
+    /** Puts the right content on the glasses for the current screen. */
+    private fun configureGlasses() {
+        val g = glasses ?: return
+        if (arActive) {
+            val feed = ensureCamera()
+            val pane = g.showCamera { ctx -> CameraPane(ctx, feed, calibration, ::phoneRotation, interactive = false) }
+            pane.session = session
+            pane.pressed = pressed
+            pane.calibrating = phonePane?.calibrating ?: false
+        } else {
+            g.showStage()
+            g.stage.session = session
+            g.stage.pressed = pressed
+            g.stage.post { g.stage.fitTo(currentSong) }
+        }
+        g.setInfo(currentSong?.let { "Piano AR · ${it.title}" } ?: "Piano AR")
     }
 
     // ───────────────────────── Helpers ─────────────────────────
@@ -423,6 +579,12 @@ class MainActivity : Activity() {
         fitsSystemWindows = true
     }
 
+    private fun row() = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
+        setPadding(16, 4, 16, 4)
+    }
+
     private fun button(label: String, onClick: (View) -> Unit) = Button(this).apply {
         text = label
         isAllCaps = false
@@ -431,12 +593,10 @@ class MainActivity : Activity() {
 
     private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
 
-    /** Holder so the frame callback can reach the current phone stage view. */
-    private class PianoStageViewRef { var phone: PianoStageView? = null }
-
     companion object {
         private const val REQ_MIDI = 1
         private const val REQ_BT = 2
+        private const val REQ_CAM = 3
         private val ACCENT = Color.rgb(0, 229, 255)
     }
 }
